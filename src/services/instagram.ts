@@ -21,6 +21,7 @@ import {
 import metaSettingsService from "./metaSettings";
 import ProcessedMessage from "../models/processedMessage";
 import ConversationLock from "../models/conversationLock";
+import MessageBuffer, { IBufferedMessage } from "../models/messageBuffer";
 
 
 const log = (stage: string, data?: Record<string, unknown>) => {
@@ -36,15 +37,11 @@ const logErr = (stage: string, err: unknown, data?: Record<string, unknown>) => 
   console.error(`[IG] ${stage}`, JSON.stringify({ ...info, ...(data ?? {}) }));
 };
 
-// ─── Per-user serialization (Mongo-backed) ───────────────────────────
-// Meta can deliver webhooks faster than we can process them, and parallel
-// processing for the SAME user causes races on conversation.save() —
-// resulting in lost messages or replies that answer the wrong question.
-// We serialize per (senderId+pageId) using a Mongo lock so it works
-// across Vercel serverless instances.
-const LOCK_POLL_MS = 200;
-const LOCK_MAX_WAIT_MS = 25_000;
-
+// ─── Per-user drainer lock (Mongo-backed) ────────────────────────────
+// At most one Lambda per user runs the buffer drain loop at a time. The
+// first message in a burst takes the lock; subsequent messages append to
+// the buffer and exit. The TTL on ConversationLock auto-cleans orphaned
+// locks if a Lambda crashes mid-drain.
 const acquireLock = async (key: string): Promise<boolean> => {
   try {
     await ConversationLock.create({ key });
@@ -57,25 +54,6 @@ const acquireLock = async (key: string): Promise<boolean> => {
 
 const releaseLock = async (key: string): Promise<void> => {
   await ConversationLock.deleteOne({ key }).catch(() => {});
-};
-
-const runSerializedPerUser = async (
-  key: string,
-  task: () => Promise<void>
-): Promise<void> => {
-  const startedAt = Date.now();
-  while (!(await acquireLock(key))) {
-    if (Date.now() - startedAt > LOCK_MAX_WAIT_MS) {
-      log("lock.timeout", { key, waitedMs: Date.now() - startedAt });
-      throw new Error(`Timed out waiting for lock: ${key}`);
-    }
-    await new Promise((r) => setTimeout(r, LOCK_POLL_MS));
-  }
-  try {
-    await task();
-  } finally {
-    await releaseLock(key);
-  }
 };
 
 // ─── Webhook deduplication (Mongo-backed) ────────────────────────────
@@ -91,6 +69,85 @@ const isDuplicateMessage = async (mid: string | undefined): Promise<boolean> => 
     if (err?.code === 11000) return true;
     throw err;
   }
+};
+
+// ─── Message coalescing (Mongo-backed buffer) ────────────────────────
+// We optimize for fast replies (Intercom/ManyChat-style) but still
+// gracefully handle burst typing.
+//
+// Behavior:
+//   - 1 message in the wait window → reply immediately to it (fast path)
+//   - 2+ messages in the wait window → combine them into a single reply
+//   - Wait window is short (1s) so single-message replies feel snappy
+//
+// Flow per webhook:
+//   1. Append message to MessageBuffer (atomic upsert).
+//   2. Try to acquire ConversationLock. If another Lambda already holds
+//      it, exit — our message is in the buffer for the drainer to pick up.
+//   3. If we got the lock, sleep for COALESCE_WINDOW_MS, then drain.
+//      Whatever's in the buffer at drain time gets one combined reply.
+const COALESCE_WINDOW_MS = 1000;
+const DRAIN_MAX_TOTAL_MS = 8_000;
+const BURST_MAX_MESSAGES = 10;
+const BURST_MAX_CHARS = 4000;
+
+const appendToBuffer = async (
+  key: string,
+  text: string,
+  mid: string | undefined
+): Promise<void> => {
+  const now = new Date();
+  await MessageBuffer.updateOne(
+    { key },
+    {
+      $push: { messages: { text, mid, receivedAt: now } },
+      $set: { lastMessageAt: now },
+      $setOnInsert: { key, createdAt: now },
+    },
+    { upsert: true }
+  );
+};
+
+const readBuffer = async (key: string) => {
+  return MessageBuffer.findOne({ key }).lean<{
+    key: string;
+    messages: IBufferedMessage[];
+    lastMessageAt: Date;
+  } | null>();
+};
+
+// Atomic snapshot-and-clear: returns the messages that were in the buffer
+// at the moment of the call and resets the array to []. Any concurrent
+// $push from a webhook will land in the now-empty array and be picked up
+// by the next drain iteration — nothing is dropped.
+const snapshotAndClearBuffer = async (
+  key: string
+): Promise<IBufferedMessage[]> => {
+  const before = await MessageBuffer.findOneAndUpdate(
+    { key },
+    { $set: { messages: [] } }
+  ).lean<{ messages: IBufferedMessage[] } | null>();
+  return before?.messages ?? [];
+};
+
+const deleteBufferIfEmpty = async (key: string): Promise<void> => {
+  // Only deletes the doc if no new messages have been pushed since we
+  // cleared it. If new messages arrived, leaves the doc alone for the
+  // next drain iteration.
+  await MessageBuffer.deleteOne({ key, messages: { $size: 0 } }).catch(() => {});
+};
+
+const combineBurst = (messages: IBufferedMessage[]): string => {
+  // Respect burst caps: keep most recent up to BURST_MAX_MESSAGES, then
+  // truncate by char budget (oldest dropped first).
+  let chosen = messages.slice(-BURST_MAX_MESSAGES);
+  let total = chosen.reduce((n, m) => n + m.text.length, 0);
+  while (chosen.length > 1 && total > BURST_MAX_CHARS) {
+    total -= chosen[0].text.length;
+    chosen = chosen.slice(1);
+  }
+  if (chosen.length === 1) return chosen[0].text.trim();
+  return chosen.map((m) => m.text.trim()).filter(Boolean).join("\n\n");
 };
 
 // ─── Types ──────────────────────────────────────────────────────────
@@ -246,13 +303,144 @@ const processMessagingEvent = async (event: MessagingEvent) => {
   }
   log("event.access-token-resolved", { tokenLen: accessToken.length });
 
-  await runSerializedPerUser(`${senderId}:${recipientId}`, async () => {
-    try {
-      await processIncomingMessage(senderId, recipientId, messageText, accessToken);
-    } catch (error) {
-      logErr("event.process-failed", error, { senderId, recipientId });
+  const key = `${senderId}:${recipientId}`;
+
+  // Always append the incoming message to the per-user buffer first.
+  await appendToBuffer(key, messageText, mid);
+  log("buffer.appended", { senderId, recipientId, mid, textLen: messageText.length });
+
+  // Try to become the drainer for this user.
+  //
+  // Two cases when acquireLock fails:
+  //   - Live drainer: another Lambda is actively processing; it'll drain
+  //     our message along with theirs. Safe to exit.
+  //   - Crashed Lambda: the lock is orphaned. Mongo's 15s TTL will clean
+  //     it up automatically. Until then, we can't proceed — but the
+  //     user's *next* message will succeed and pick up everything in the
+  //     buffer (buffer has its own 5-min TTL).
+  //
+  // We make one short retry to handle the common transient race where
+  // two webhooks arrive within milliseconds. Beyond that, the TTL is the
+  // recovery mechanism — anything longer would risk hitting Vercel's
+  // function timeout, which would only orphan more locks.
+  let acquired = await acquireLock(key);
+  if (!acquired) {
+    await new Promise((r) => setTimeout(r, 300));
+    // If a live drainer already processed our message, the buffer will
+    // be empty — nothing more to do.
+    const buf = await readBuffer(key);
+    if (!buf || buf.messages.length === 0) {
+      log("buffer.drained-by-other", { senderId, recipientId });
+      return;
     }
+    acquired = await acquireLock(key);
+    if (!acquired) {
+      log("buffer.drainer-already-running", { senderId, recipientId });
+      return;
+    }
+    log("buffer.lock-acquired-on-retry", { senderId, recipientId });
+  }
+
+  // Send a typing indicator immediately so the user sees the bot is
+  // "thinking" during the coalesce window and AI generation.
+  await sendInstagramTypingIndicator(accessToken, senderId).catch((err) => {
+    logErr("typing-indicator.failed", err, { senderId });
   });
+
+  try {
+    await drainBufferLoop(senderId, recipientId, accessToken);
+  } catch (error) {
+    logErr("buffer.drain-failed", error, { senderId, recipientId });
+  } finally {
+    await releaseLock(key);
+  }
+
+  // After releasing the lock, double-check the buffer one more time.
+  // It is possible a webhook appended a message in the tiny window
+  // between our last buffer-empty check and lock release. If we don't
+  // pick it up, that message would sit until the next webhook arrives.
+  const trailing = await readBuffer(key);
+  if (trailing && trailing.messages.length > 0) {
+    log("buffer.trailing-message-detected", {
+      senderId,
+      bufferedCount: trailing.messages.length,
+    });
+    if (await acquireLock(key)) {
+      try {
+        await drainBufferLoop(senderId, recipientId, accessToken);
+      } catch (error) {
+        logErr("buffer.trailing-drain-failed", error, { senderId, recipientId });
+      } finally {
+        await releaseLock(key);
+      }
+    }
+    // If we can't reacquire the lock, another Lambda already did — they'll handle it.
+  }
+};
+
+// ─── Coalesce drain loop ─────────────────────────────────────────────
+// Only one Lambda per user runs this at a time (gated by ConversationLock).
+// Sleep for COALESCE_WINDOW_MS to catch any rapid follow-up messages, then
+// drain whatever's in the buffer with a single combined reply. After the
+// reply, if more messages arrived during AI generation, loop and handle
+// the next batch the same way.
+const drainBufferLoop = async (
+  senderId: string,
+  recipientId: string,
+  accessToken: string
+) => {
+  const key = `${senderId}:${recipientId}`;
+  const startedAt = Date.now();
+
+  // Initial coalesce wait — gives rapid follow-ups a chance to land before
+  // we read and reply. Short enough that single-message latency stays low.
+  await new Promise((r) => setTimeout(r, COALESCE_WINDOW_MS));
+
+  while (true) {
+    const messages = await snapshotAndClearBuffer(key);
+
+    if (messages.length === 0) {
+      log("buffer.empty-on-drain", { senderId });
+      await deleteBufferIfEmpty(key);
+      return;
+    }
+
+    const combined = combineBurst(messages);
+
+    log("buffer.draining", {
+      senderId,
+      bufferedCount: messages.length,
+      combinedLen: combined.length,
+    });
+
+    if (!combined) {
+      await deleteBufferIfEmpty(key);
+      return;
+    }
+
+    try {
+      await processIncomingMessage(senderId, recipientId, combined, accessToken);
+    } catch (err) {
+      logErr("buffer.process-failed", err, { senderId, recipientId });
+    }
+
+    // Check whether new messages arrived while we were generating the reply.
+    // If so, drain them in a fresh batch — without another coalesce wait,
+    // since the user already waited through our AI generation time.
+    const after = await readBuffer(key);
+    if (!after || after.messages.length === 0) {
+      await deleteBufferIfEmpty(key);
+      return;
+    }
+    log("buffer.new-messages-during-process", {
+      senderId,
+      bufferedCount: after.messages.length,
+    });
+    if (Date.now() - startedAt >= DRAIN_MAX_TOTAL_MS) {
+      log("buffer.drain-hard-timeout", { senderId, totalElapsed: Date.now() - startedAt });
+      return;
+    }
+  }
 };
 
 // ─── Gate checks + AI response ──────────────────────────────────────
@@ -263,15 +451,11 @@ const processIncomingMessage = async (
   messageText: string,
   accessToken: string
 ) => {
-  log("incoming.start", { senderId, pageId, messageText });
+  log("incoming.start", { senderId, pageId, messageTextLen: messageText.length });
   const conversation = await getOrCreateConversation(senderId, pageId);
 
-  // Send typing indicator while we process
-  await sendInstagramTypingIndicator(accessToken, senderId).catch((err) => {
-    logErr("typing-indicator.failed", err, { senderId });
-  });
-
-  // Process the message through the AI pipeline (same logic as chatbot)
+  // Process the message through the AI pipeline (same logic as chatbot).
+  // Typing indicator was already sent by the drainer at burst start.
   await processAIResponse(senderId, messageText, conversation, accessToken);
   log("incoming.done", { senderId });
 };

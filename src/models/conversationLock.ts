@@ -8,7 +8,7 @@ export interface IConversationLock extends Document {
 const conversationLockSchema = new Schema<IConversationLock>(
   {
     key: { type: String, required: true, unique: true },
-    createdAt: { type: Date, default: Date.now, expires: 120 },
+    createdAt: { type: Date, default: Date.now, expires: 15 },
   },
   { versionKey: false }
 );
