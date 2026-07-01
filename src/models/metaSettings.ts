@@ -11,6 +11,8 @@ export interface IMetaSettings extends Document {
   connected: boolean;
   /** Timestamp of last successful connection test */
   lastTestedAt: Date | null;
+  /** When the current long-lived token expires (set after a refresh) */
+  tokenExpiresAt: Date | null;
 }
 
 const metaSettingsSchema = new Schema<IMetaSettings>(
@@ -20,6 +22,7 @@ const metaSettingsSchema = new Schema<IMetaSettings>(
     instagramPageId: { type: String, default: null },
     connected: { type: Boolean, default: false },
     lastTestedAt: { type: Date, default: null },
+    tokenExpiresAt: { type: Date, default: null },
   },
   { timestamps: true }
 );
