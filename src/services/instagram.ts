@@ -492,14 +492,21 @@ const processAIResponse = async (
 
   // ── Completed conversation ──
   if (conversation.status === "COMPLETED") {
+    const hasProfessionalFlow =
+      conversation.currentFlow && conversation.currentFlow !== "GENERAL";
+
     log("ai.branch.completed", {
       senderId,
       currentFlow: conversation.currentFlow,
       hasEmail: Boolean(contactData.email),
       hasPhone: Boolean(contactData.phone),
-      note: "no reply will be sent — conversation already COMPLETED",
+      note:
+        hasProfessionalFlow && (contactData.email || contactData.phone)
+          ? "contact received after completion — will capture and acknowledge"
+          : "reopening completed conversation for a new message",
     });
-    if (conversation.currentFlow && conversation.currentFlow !== "GENERAL") {
+
+    if (hasProfessionalFlow && (contactData.email || contactData.phone)) {
       if (contactData.email) {
         conversation.capturedData.email = contactData.email;
         conversation.tags = addUniqueTags(conversation.tags, ["EMAIL_RECEIVED"]);
@@ -508,9 +515,31 @@ const processAIResponse = async (
         conversation.capturedData.phone = contactData.phone;
         conversation.tags = addUniqueTags(conversation.tags, ["PHONE_RECEIVED"]);
       }
+
+      const acknowledgement = contactData.email && contactData.phone
+        ? "Got it — I've noted your email and phone number. Someone from our team will reach out to you soon."
+        : contactData.email
+          ? "Got it — I've noted your email. Someone from our team will reach out to you soon."
+          : "Got it — I've noted your phone number. Someone from our team will reach out to you soon.";
+
+      const assistantMsg = buildAssistantMessage(
+        conversation.currentFlow,
+        acknowledgement,
+        conversation.messageStep + 1
+      );
+      conversation.messages.push(assistantMsg);
+      conversation.messageStep += 1;
+
+      await conversation.save();
+      await sendInstagramMessage(accessToken, senderId, acknowledgement);
+      return;
     }
-    await conversation.save();
-    return;
+
+    conversation.status = "ACTIVE";
+    conversation.currentFlow = null;
+    conversation.messageStep = 0;
+    conversation.profileType = null;
+    conversation.classificationSource = "fallback";
   }
 
   // ── Waiting for contact info ──
